@@ -1,0 +1,20 @@
+[Unit]
+Description=CDP proxy for slot %i: POOL_BIND:930%i -> 127.0.0.1:920%i
+Requires=browser-chrome@%i.service
+After=browser-chrome@%i.service
+PartOf=browser-slot@%i.service
+
+[Service]
+Type=simple
+User=browser
+Group=browser
+# POOL_BIND, the address the CDP ports listen on, comes from the pool's config
+# file, which setup.sh writes.
+EnvironmentFile=/etc/browsermaze/config
+# 930N is above 1024, so no CAP_NET_BIND_SERVICE is needed to bind it.
+ExecStart=/usr/bin/socat TCP-LISTEN:930%i,bind=${POOL_BIND},fork,reuseaddr TCP:127.0.0.1:920%i
+# socat catches SIGTERM and exits 143, which systemd would record as a failed
+# unit after every release; 143 is its normal answer to a stop.
+SuccessExitStatus=143
+Restart=on-failure
+RestartSec=2

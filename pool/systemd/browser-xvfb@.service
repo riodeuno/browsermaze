@@ -1,0 +1,13 @@
+[Unit]
+Description=Virtual display :%i for browser pool slot %i
+PartOf=browser-slot@%i.service
+
+[Service]
+Type=simple
+User=browser
+Group=browser
+# -nolisten tcp: the display needs only its local socket, so nothing here
+# opens a TCP X11 port.
+ExecStart=/usr/bin/Xvfb :%i -screen 0 1920x1080x24 -nolisten tcp
+Restart=on-failure
+RestartSec=2

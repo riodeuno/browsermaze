@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# browsermaze — the one command on every machine setup.sh touches: browsermaze <subcommand>.
+#
+#   browsermaze login      on your Mac or Linux desktop: add or renew logins in the browser pool's
+#                          golden profile. It opens a login-only Chrome, waits while you log in,
+#                          then runs `browsermaze golden import` on the pool over an ssh reverse
+#                          tunnel and closes Chrome.
+#   browsermaze version    the installed version (--version too)
+#   browsermaze lease, release, record, status, golden, logins
+#                          on the pool machine: passed on to the pool program, which setup.sh
+#                          installs at $POOL_PROGRAM and which runs as root through one sudo rule.
+#
+# Installed by setup.sh, which also installs gum and writes the config `login` reads: POOL_SSH
+# (where to ssh: anything ssh accepts, such as user@host or a host alias) and, optionally,
+# POOL_SSH_KEY (an ssh identity file).
+set -euo pipefail
+
+# The pool role installs the pool program here, root-owned: the sudo rule names this path. The
+# variable is for tests; pointing it elsewhere gives no root, since sudo checks the path itself.
+POOL_PROGRAM=${BROWSERMAZE_POOL_PROGRAM:-/usr/local/lib/browsermaze/browsermaze-pool}
+
+# Setup links this command into ~/.local/bin; VERSION sits next to the real file.
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -h "$SOURCE" ]]; do
+  LINK_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" == /* ]] || SOURCE="$LINK_DIR/$SOURCE"
+done
+HERE="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+
+usage() {
+  cat <<'EOF'
+usage: browsermaze <subcommand>
+
+  login                  log in to sites on this desktop and copy the logins to the browser pool
+  version                print the version
+
+On the pool machine (ssh <user>@<host> browsermaze <subcommand> from anywhere else):
+  lease                  take the first free slot
+  release N              give slot N back
+  record start N | stop N
+  status                 one line per slot
+  logins                 the sites the golden profile is logged in to
+  golden start | stop | import
+EOF
+}
+
+case "${1:-}" in
+  version|--version) echo "browsermaze $(cat "$HERE/VERSION")"; exit 0 ;;
+  -h|--help|help) usage; exit 0 ;;
+  "") usage >&2; exit 2 ;;
+  login) [[ $# -eq 1 ]] || { echo "browsermaze login takes no arguments" >&2; exit 2; } ;;
+  *)
+    [[ -x "$POOL_PROGRAM" ]] || {
+      echo "browsermaze $1: this machine is not a pool (no $POOL_PROGRAM). Run it on the pool machine, or through ssh <user>@<host> browsermaze $*" >&2
+      exit 1
+    }
+    exec "$POOL_PROGRAM" "$@" ;;
+esac
+
+# From here on: browsermaze login.
+
+export PATH="$HOME/.local/bin:$PATH"  # where setup.sh puts gum
+# Chrome: CHROME when set, otherwise the usual place on this OS. setup.sh's chrome_path has the
+# same Linux names.
+CHROME=${CHROME:-}
+if [[ -z "$CHROME" && "$(uname -s)" == Darwin ]]; then
+  CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+fi
+if [[ -z "$CHROME" ]]; then
+  for name in google-chrome google-chrome-stable chromium chromium-browser; do
+    if CHROME=$(command -v "$name"); then break; fi
+  done
+fi
+PROFILE="$HOME/browsers-login"
+CONFIG=${BROWSERMAZE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/browsermaze/config}
+CDP="http://localhost:9222"
+
+conf_get() { [[ -f "$CONFIG" ]] || return 0; sed -n "s/^$1=//p" "$CONFIG" | tail -n 1; }
+POOL=$(conf_get POOL_SSH)
+KEY=$(conf_get POOL_SSH_KEY)
+[[ -n "$POOL" ]] || { echo "No pool in $CONFIG. Run setup.sh with --pool user@host."; exit 1; }
+SSH=(ssh)
+[[ -z "$KEY" ]] || SSH+=(-i "$KEY")
+
+command -v gum >/dev/null || { echo "gum is missing. Run setup.sh again."; exit 1; }
+
+say()  { gum style --foreground 212 --bold "$*"; }
+fail() { gum style --foreground 196 "✗ $*"; exit 1; }
+ok()   { gum style --foreground 42 "✓ $*"; }
+
+gum style --border rounded --padding "0 2" --border-foreground 212 \
+  "Browser pool logins" "Logins you add here reach every slot leased after the update."
+
+say "Step 1 of 3 — checks"
+[[ -x "$CHROME" ]] || fail "Chrome not found${CHROME:+ at $CHROME}. Install Chrome, or set CHROME to its path."
+[[ -z "$KEY" || -f "$KEY" ]] || fail "ssh key not found at $KEY"
+gum spin --title "Reaching $POOL ..." -- \
+  "${SSH[@]}" -o BatchMode=yes -o ConnectTimeout=5 "$POOL" true \
+  || fail "cannot ssh to $POOL"
+ok "the browser pool answers"
+# A Chrome already on :9222 would take the new window and our launch would exit
+# at once, leaving nothing for this script to close.
+if curl -s -m 2 "$CDP/json/version" >/dev/null; then
+  fail "something already listens on port 9222 — close the login-only Chrome and run this again"
+fi
+
+say "Step 2 of 3 — log in"
+"$CHROME" --user-data-dir="$PROFILE" --remote-debugging-port=9222 \
+  --no-first-run --no-default-browser-check >/dev/null 2>&1 &
+CHROME_PID=$!
+close_chrome() {
+  if kill -0 "$CHROME_PID" 2>/dev/null; then
+    kill "$CHROME_PID"
+    wait "$CHROME_PID" 2>/dev/null || true
+    ok "login-only Chrome closed"
+  fi
+}
+trap close_chrome EXIT
+
+for _ in $(seq 60); do
+  curl -s -m 1 "$CDP/json/version" >/dev/null && break
+  kill -0 "$CHROME_PID" 2>/dev/null || fail "Chrome exited before it opened"
+  sleep 0.5
+done
+curl -s -m 1 "$CDP/json/version" >/dev/null || fail "Chrome did not open its debugging port within 30s"
+ok "login-only Chrome is open (profile: $PROFILE)"
+
+cat <<'EOF'
+
+  In the Chrome window that just opened:
+    1. Log in to each site you want the agents to use.
+    2. Leave one tab open on each of those sites. Cookies from every site
+       are copied, but site storage only from the tabs left open.
+
+EOF
+
+open_sites() {
+  curl -s -m 2 "$CDP/json" | sed -nE 's#^ *"url": "(https?://[^/"]+).*#\1#p' | sort -u
+}
+
+while true; do
+  choice=$(gum choose --header "When you are done logging in:" \
+    "Update the browser pool" "Quit without updating")
+  [[ "$choice" == "Quit without updating" ]] && { say "Nothing copied."; exit 0; }
+
+  sites=$(open_sites)
+  if [[ -z "$sites" ]]; then
+    gum style --foreground 214 "No website tab is open. Open a tab on each site you logged in to, then choose again."
+    continue
+  fi
+  echo "Open sites:"
+  # shellcheck disable=SC2001  # indents every line of a multi-line value
+  sed 's/^/  /' <<<"$sites"
+  gum confirm "Copy the logins to the browser pool now?" || continue
+
+  say "Step 3 of 3 — update"
+  if "${SSH[@]}" -o ExitOnForwardFailure=yes -R 9222:localhost:9222 "$POOL" browsermaze golden import; then
+    ok "browser pool updated"
+    break
+  fi
+  gum style --foreground 196 "The import failed; its output is above. Chrome stays open so you can fix it and try again."
+done

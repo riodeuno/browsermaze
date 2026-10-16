@@ -1,0 +1,13 @@
+[Unit]
+Description=Browser pool slot %i (Xvfb + Chrome + CDP proxy)
+Requires=browser-xvfb@%i.service browser-chrome@%i.service browser-cdp-proxy@%i.service
+After=browser-xvfb@%i.service browser-chrome@%i.service browser-cdp-proxy@%i.service
+
+[Service]
+# The three real units declare PartOf=browser-slot@%i.service, so stopping
+# or restarting this unit stops or restarts all three; Requires+After above
+# is what brings them up when this unit starts. This unit itself runs
+# nothing.
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true

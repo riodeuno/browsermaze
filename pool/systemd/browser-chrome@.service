@@ -1,0 +1,33 @@
+[Unit]
+Description=Chrome for browser pool slot %i, CDP on 127.0.0.1:920%i
+Requires=browser-xvfb@%i.service
+After=browser-xvfb@%i.service
+PartOf=browser-slot@%i.service
+
+[Service]
+Type=simple
+User=browser
+Group=browser
+Environment=DISPLAY=:%i
+# --password-store=basic: every Chrome here, golden and slot alike, must
+# encrypt cookies with the same fixed Linux key. Chrome's default keyring
+# backend ties encryption to the desktop session (gnome-keyring/kwallet),
+# which does not exist here, and would leave a slot unable to decrypt the
+# cookies rsync just copied from the golden profile.
+#
+# No --remote-debugging-address: Chrome's CDP already binds 127.0.0.1 only
+# by default, which is why browser-cdp-proxy@.service exists to forward it
+# out.
+# --enable-unsafe-swiftshader: Xvfb has no GPU, and without this Chrome
+# offers pages no WebGL at all, so a WebGL canvas records as blank.
+ExecStart=/usr/bin/google-chrome \
+    --user-data-dir=/srv/browsers/slots/%i \
+    --remote-debugging-port=920%i \
+    --no-first-run \
+    --no-default-browser-check \
+    --password-store=basic \
+    --enable-unsafe-swiftshader \
+    --window-size=1920,1080 \
+    --start-maximized
+Restart=on-failure
+RestartSec=2

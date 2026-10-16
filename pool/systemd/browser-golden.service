@@ -1,0 +1,11 @@
+[Unit]
+Description=The golden Chrome profile (Xvfb :99 + Chrome + x11vnc)
+Requires=browser-golden-xvfb.service browser-golden-chrome.service browser-golden-vnc.service
+After=browser-golden-xvfb.service browser-golden-chrome.service browser-golden-vnc.service
+
+[Service]
+# Same shape as browser-slot@.service: the three real units declare
+# PartOf=browser-golden.service, so stopping this unit stops all three.
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true

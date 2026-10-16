@@ -1,0 +1,27 @@
+[Unit]
+Description=Golden Chrome, the profile every lease copies from, CDP on 127.0.0.1:9299
+Requires=browser-golden-xvfb.service
+After=browser-golden-xvfb.service
+PartOf=browser-golden.service
+
+[Service]
+Type=simple
+User=browser
+Group=browser
+Environment=DISPLAY=:99
+# --password-store=basic - see browser-chrome@.service's comment: every
+# Chrome here shares the same fixed Linux key, or a slot could not decrypt
+# the cookies rsync just copied from this profile.
+# --enable-unsafe-swiftshader: Xvfb has no GPU, and without this Chrome
+# offers pages no WebGL at all, so a WebGL canvas records as blank.
+ExecStart=/usr/bin/google-chrome \
+    --user-data-dir=/srv/browsers/golden \
+    --remote-debugging-port=9299 \
+    --no-first-run \
+    --no-default-browser-check \
+    --password-store=basic \
+    --enable-unsafe-swiftshader \
+    --window-size=1920,1080 \
+    --start-maximized
+Restart=on-failure
+RestartSec=2

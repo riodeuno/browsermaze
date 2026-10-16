@@ -1,0 +1,24 @@
+[Unit]
+Description=x11vnc on golden Chrome's display :99, loopback only
+Requires=browser-golden-xvfb.service
+After=browser-golden-xvfb.service
+PartOf=browser-golden.service
+
+[Service]
+Type=simple
+User=browser
+Group=browser
+Environment=DISPLAY=:99
+# -localhost: binds 127.0.0.1 only. A VNC client reaches this through
+# `ssh -L 5900:127.0.0.1:5900`, never directly: nothing here opens :5900 on
+# any other address. -rfbauth needs the password file `browsermaze golden
+# start` creates before it starts this unit; started any other way, this
+# unit fails until that file exists.
+ExecStart=/usr/bin/x11vnc -display :99 -rfbport 5900 -rfbauth /srv/browsers/vnc-passwd -localhost -forever -shared -quiet
+# x11vnc catches SIGTERM and exits 2, which systemd would record as a failed
+# unit after every `browsermaze golden stop` and every import; 2 is its normal
+# answer to a stop. It is also x11vnc's code for a bad argument at start, so a
+# start that fails that way shows up as VNC not answering, not as a failed unit.
+SuccessExitStatus=2
+Restart=on-failure
+RestartSec=2

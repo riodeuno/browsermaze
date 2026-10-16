@@ -1,0 +1,651 @@
+#!/usr/bin/env python3
+"""browsermaze-pool - lease, record and release Chrome slots on the browser pool machine.
+
+Users run it as `browsermaze <subcommand>`; the browsermaze command passes every pool
+subcommand on to this program.
+
+The design this implements is the repository's README. Read that first;
+this docstring only orients the code.
+
+    browsermaze lease                take the first free slot, print
+                                      "N http://<address>:930N"
+    browsermaze release N            stop any recording, stop the slot,
+                                      free the lease
+    browsermaze record start N       start an x11grab recording of slot N
+    browsermaze record stop N        stop it cleanly, print the .mp4 path
+    browsermaze status               one line per slot, plus golden
+    browsermaze golden start         golden Chrome on :99 + x11vnc
+    browsermaze golden stop
+    browsermaze golden import        pull cookies/localStorage from a
+                                      the login machine's Chrome
+                                      (ssh -R 9222) into the golden profile
+    browsermaze logins               one site per line the golden profile
+                                      holds a cookie for
+
+Runs as root: it starts and stops system units, and writes into
+/srv/browsers, which is owned by the `browser` service account and not
+group- or world-writable (golden holds every imported login). Invoked as
+any other user, it re-execs itself through `sudo -n`, so the documented
+invocation ("browsermaze lease" over ssh as the caller login, whose only sudo
+right is this program) needs no sudo prefix at the call site.
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import fcntl
+import itertools
+import json
+import os
+import pwd
+import secrets
+import shutil
+import signal
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections import Counter
+from pathlib import Path
+
+import websockets
+
+BASE = Path("/srv/browsers")
+GOLDEN_DIR = BASE / "golden"
+SLOTS_DIR = BASE / "slots"
+LEASES_DIR = BASE / "leases"
+VIDEOS_DIR = BASE / "videos"
+RECORDINGS_DIR = BASE / "recordings"
+VNC_PASSWD = BASE / "vnc-passwd"
+VNC_PASSWORD_TXT = BASE / "vnc-password.txt"
+
+CONFIG_PATH = Path("/etc/browsermaze/config")
+BIND_ADDRESS = ""  # POOL_BIND in the config: the address the CDP ports listen on
+SLOT_COUNT = 0  # POOL_SLOTS in the config
+LEASE_STALE_SECONDS = 2 * 3600
+GOLDEN_CDP_PORT = 9299
+LOGIN_CDP_URL = "http://127.0.0.1:9222"  # reached through the login command's `ssh -R 9222`
+RECORD_STOP_GRACE_SECONDS = 10
+
+
+def die(msg: str) -> None:
+    print(f"FAILED: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def require_root() -> None:
+    if os.geteuid() == 0:
+        return
+    script = os.path.abspath(sys.argv[0])
+    try:
+        os.execvp("sudo", ["sudo", "-n", script] + sys.argv[1:])
+    except FileNotFoundError:
+        die("not root and no sudo on PATH - run this as root")
+
+
+def read_config() -> dict[str, str]:
+    """The KEY=value lines of CONFIG_PATH, which setup.sh writes and the
+    systemd units read too."""
+    try:
+        lines = CONFIG_PATH.read_text().splitlines()
+    except OSError as e:
+        die(f"cannot read {CONFIG_PATH} ({e.strerror}) - run setup.sh to create it")
+    values = {}
+    for line in lines:
+        key, sep, value = line.strip().partition("=")
+        if sep and not key.startswith("#"):
+            values[key.strip()] = value.strip()
+    return values
+
+
+def load_config() -> None:
+    """Set BIND_ADDRESS and SLOT_COUNT from POOL_BIND and POOL_SLOTS."""
+    global BIND_ADDRESS, SLOT_COUNT
+    values = read_config()
+    BIND_ADDRESS = values.get("POOL_BIND", "")
+    if not BIND_ADDRESS:
+        die(f"POOL_BIND is not set in {CONFIG_PATH} - run setup.sh again")
+    try:
+        SLOT_COUNT = int(values.get("POOL_SLOTS", ""))
+    except ValueError:
+        die(f"POOL_SLOTS in {CONFIG_PATH} is not a number - run setup.sh again")
+
+
+def validate_slot(n: int) -> None:
+    if not 1 <= n <= SLOT_COUNT:
+        die(f"slot number must be 1-{SLOT_COUNT}, got {n}")
+
+
+def browser_uid_gid() -> tuple[int, int]:
+    pw = pwd.getpwnam("browser")
+    return pw.pw_uid, pw.pw_gid
+
+
+def chown_browser(path: Path) -> None:
+    uid, gid = browser_uid_gid()
+    os.chown(path, uid, gid)
+
+
+# --- systemd -----------------------------------------------------------------
+
+def systemctl(*args: str, check: bool = True) -> subprocess.CompletedProcess:
+    result = subprocess.run(["systemctl", *args], capture_output=True, text=True)
+    if check and result.returncode != 0:
+        raise RuntimeError(f"systemctl {' '.join(args)}: {result.stderr.strip()}")
+    return result
+
+
+def unit_active(unit: str) -> bool:
+    return subprocess.run(["systemctl", "is-active", "--quiet", unit]).returncode == 0
+
+
+# --- HTTP polling (CDP's own /json endpoints) ---------------------------------
+
+def http_json(url: str, timeout: float = 5, method: str = "GET") -> object:
+    req = urllib.request.Request(url, method=method)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        body = r.read()
+    return json.loads(body) if body else None
+
+
+def http_call(url: str, timeout: float = 5, method: str = "GET") -> None:
+    """Fire a CDP HTTP endpoint whose response is not JSON, e.g. /json/close
+    (plain text "Target is closing"). The call is fire-and-forget."""
+    req = urllib.request.Request(url, method=method)
+    with urllib.request.urlopen(req, timeout=timeout):
+        pass
+
+
+def wait_for_http(url: str, timeout: float = 30, interval: float = 0.5) -> object:
+    deadline = time.monotonic() + timeout
+    last_err: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            return http_json(url, timeout=2)
+        except Exception as e:  # noqa: BLE001 - polling, any failure just retries
+            last_err = e
+            time.sleep(interval)
+    raise TimeoutError(f"{url} did not answer within {timeout}s ({last_err})")
+
+
+# --- lease ---------------------------------------------------------------------
+
+def lease_path(n: int) -> Path:
+    return LEASES_DIR / str(n)
+
+
+def claim_free_slot() -> int | None:
+    now = time.time()
+    lockfile = LEASES_DIR / ".lock"
+    with open(lockfile, "a+") as lf:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        try:
+            for n in range(1, SLOT_COUNT + 1):
+                path = lease_path(n)
+                if path.exists():
+                    age = now - path.stat().st_mtime
+                    if age <= LEASE_STALE_SECONDS:
+                        continue
+                path.write_text(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)) + "\n")
+                chown_browser(path)
+                path.chmod(0o640)
+                return n
+            return None
+        finally:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
+
+def sync_golden_to_slot(n: int) -> None:
+    # rsync -a syncs the destination directory's own mode and ownership from
+    # the source too, so the slot directory ends up browser:browser like
+    # golden without a separate chown pass.
+    subprocess.run(
+        [
+            # --delete-excluded: the slot also loses the caches and locks the
+            # last lease left, so every lease starts from golden and nothing else.
+            "rsync", "-a", "--delete", "--delete-excluded",
+            "--exclude", "Singleton*",  # SingletonLock/-Cookie/-Socket: golden's own lock, not the slot's
+            "--exclude", "*Cache*",     # Default/Cache, GPUCache, Code Cache, ShaderCache, ...
+            f"{GOLDEN_DIR}/", f"{SLOTS_DIR / str(n)}/",
+        ],
+        check=True,
+    )
+
+
+def cmd_lease() -> None:
+    if unit_active("browser-golden-chrome.service"):
+        die("golden Chrome is running - stop it first (browsermaze golden stop)")
+    n = claim_free_slot()
+    if n is None:
+        die(f"no free slot - all {SLOT_COUNT} are leased")
+    try:
+        sync_golden_to_slot(n)
+        systemctl("start", f"browser-slot@{n}.service")
+        wait_for_http(f"http://127.0.0.1:920{n}/json/version", timeout=30)
+    except Exception as e:  # noqa: BLE001 - any failure here must free the slot
+        systemctl("stop", f"browser-slot@{n}.service", check=False)
+        lease_path(n).unlink(missing_ok=True)
+        die(f"lease of slot {n} failed: {e}")
+    print(f"{n} http://{BIND_ADDRESS}:930{n}")
+
+
+# --- release ---------------------------------------------------------------------
+
+def cmd_release(n: int) -> None:
+    validate_slot(n)
+    if recording_state_path(n).exists():
+        path = stop_recording(n)
+        print(f"stopped recording: {path}")
+    systemctl("stop", f"browser-slot@{n}.service", check=False)
+    was_leased = lease_path(n).exists()
+    lease_path(n).unlink(missing_ok=True)
+    print(f"released {n}" + ("" if was_leased else " (was already free)"))
+
+
+# --- record --------------------------------------------------------------------
+
+def recording_state_path(n: int) -> Path:
+    return RECORDINGS_DIR / f"{n}.json"
+
+
+def cmd_record_start(n: int) -> None:
+    validate_slot(n)
+    if not lease_path(n).exists():
+        die(f"slot {n} is not leased")
+    state_path = recording_state_path(n)
+    if state_path.exists():
+        die(f"slot {n} is already recording")
+    ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    out = VIDEOS_DIR / f"slot-{n}-{ts}.mp4"
+    # 15 fps and -preset ultrafast: at ffmpeg's defaults (30 fps, preset
+    # medium) many recordings at once overran a 4-core machine, and the
+    # videos came out with wrong durations or unfinished.
+    proc = subprocess.Popen(
+        [
+            "ffmpeg", "-f", "x11grab", "-framerate", "15", "-video_size", "1920x1080", "-i", f":{n}",
+            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-y", str(out),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    state_path.write_text(json.dumps({"pid": proc.pid, "path": str(out)}))
+    chown_browser(state_path)
+    print(f"recording {out}")
+
+
+def stop_recording(n: int) -> str:
+    """Stop the ffmpeg for slot n and return the finalized .mp4 path.
+    Caller has already checked recording_state_path(n) exists."""
+    state = json.loads(recording_state_path(n).read_text())
+    pid, path = state["pid"], state["path"]
+    # q/SIGINT is ffmpeg's clean-stop signal: it finishes the current frame
+    # and closes the mp4's moov atom. SIGKILL would leave the file unplayable.
+    # Not-SIGKILL is bounded: SIGINT, wait, then SIGTERM (still a clean exit
+    # for ffmpeg) if it has not exited after RECORD_STOP_GRACE_SECONDS.
+    def alive() -> bool:
+        # record start and record stop are separate CLI invocations, so pid
+        # is almost never this process's own child - systemd (pid's real
+        # parent once record start exits) reaps it instead. waitpid here
+        # only matters for the one case where it IS our child (e.g. a test
+        # driving both start and stop in one process): without it, a
+        # SIGINT-killed child sits as a zombie that kill(pid, 0) still
+        # reports alive, and this loop waits out the full grace period for
+        # nothing.
+        try:
+            reaped_pid, _ = os.waitpid(pid, os.WNOHANG)
+            if reaped_pid == pid:
+                return False
+        except ChildProcessError:
+            pass
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
+
+    if alive():
+        os.kill(pid, signal.SIGINT)
+        deadline = time.monotonic() + RECORD_STOP_GRACE_SECONDS
+        while alive() and time.monotonic() < deadline:
+            time.sleep(0.2)
+        if alive():
+            os.kill(pid, signal.SIGTERM)
+            deadline = time.monotonic() + RECORD_STOP_GRACE_SECONDS
+            while alive() and time.monotonic() < deadline:
+                time.sleep(0.2)
+    recording_state_path(n).unlink(missing_ok=True)
+    return path
+
+
+def cmd_record_stop(n: int) -> None:
+    validate_slot(n)
+    if not recording_state_path(n).exists():
+        die(f"no recording in progress for slot {n}")
+    print(stop_recording(n))
+
+
+# --- status ----------------------------------------------------------------------
+
+def cmd_status() -> None:
+    print(f"golden: {'running' if unit_active('browser-golden-chrome.service') else 'stopped'}")
+    now = time.time()
+    for n in range(1, SLOT_COUNT + 1):
+        path = lease_path(n)
+        if path.exists():
+            age = int(now - path.stat().st_mtime)
+            leased = f"leased {age}s ago" + (" (stale)" if age > LEASE_STALE_SECONDS else "")
+        else:
+            leased = "free"
+        unit = "up" if unit_active(f"browser-slot@{n}.service") else "down"
+        recording = "recording" if recording_state_path(n).exists() else "idle"
+        print(f"slot {n}: {leased}, unit {unit}, {recording}")
+
+
+# --- logins ------------------------------------------------------------------------
+
+# Chrome has kept the Cookies SQLite database at Default/Cookies for most of
+# its history and moved it to Default/Network/Cookies in newer releases
+# (the "NetworkService"-owned cookie store). Check both rather than pinning
+# one, so a golden profile built by either Chrome layout is read correctly.
+GOLDEN_COOKIES_CANDIDATES = ("Default/Network/Cookies", "Default/Cookies")
+
+
+def golden_cookies_path() -> Path | None:
+    for rel in GOLDEN_COOKIES_CANDIDATES:
+        candidate = GOLDEN_DIR / rel
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def cmd_logins() -> None:
+    path = golden_cookies_path()
+    if path is None:
+        return  # no golden profile yet, or it has never held a cookie
+
+    # Copy the database (and its WAL/SHM sidecars, if Chrome left the
+    # database in WAL mode) to a temp file before reading it, rather than
+    # opening the live file with SQLite's mode=ro&immutable=1 URI.
+    # immutable=1 tells SQLite the file will not change out from under it,
+    # which is false here: golden Chrome may be running and writing cookies
+    # at the same moment this runs. A copy sidesteps that assumption
+    # entirely, never takes any lock the live file's readers or writers
+    # hold, and so can never block a concurrent `lease` (which only reads
+    # golden) or be blocked by one.
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_cookies = Path(tmp_dir) / "Cookies"
+        try:
+            shutil.copy2(path, tmp_cookies)
+            for suffix in ("-wal", "-shm"):
+                sidecar = path.with_name(path.name + suffix)
+                if sidecar.exists():
+                    shutil.copy2(sidecar, Path(tmp_dir) / (tmp_cookies.name + suffix))
+            conn = sqlite3.connect(str(tmp_cookies))
+            try:
+                # host_key only: the output is site names, never cookie
+                # values, names or any other column.
+                rows = conn.execute("SELECT host_key FROM cookies").fetchall()
+            finally:
+                conn.close()
+        except (OSError, sqlite3.Error) as e:
+            die(f"could not read golden cookies at {path}: {e}")
+
+    hosts = sorted({host_key.lstrip(".") for (host_key,) in rows if host_key})
+    for host in hosts:
+        print(host)
+
+
+# --- golden start/stop ------------------------------------------------------------
+
+def ensure_vnc_password() -> None:
+    if VNC_PASSWD.exists():
+        return
+    password = secrets.token_urlsafe(12)
+    subprocess.run(["x11vnc", "-storepasswd", password, str(VNC_PASSWD)], check=True)
+    VNC_PASSWD.chmod(0o600)
+    chown_browser(VNC_PASSWD)
+    VNC_PASSWORD_TXT.write_text(password + "\n")
+    VNC_PASSWORD_TXT.chmod(0o600)
+    chown_browser(VNC_PASSWORD_TXT)
+    print(f"created {VNC_PASSWD} and {VNC_PASSWORD_TXT} (mode 600)")
+
+
+def cmd_golden_start() -> None:
+    ensure_vnc_password()
+    systemctl("start", "browser-golden.service")
+    wait_for_http(f"http://127.0.0.1:{GOLDEN_CDP_PORT}/json/version", timeout=30)
+    print(f"golden Chrome up on :99, CDP 127.0.0.1:{GOLDEN_CDP_PORT}, VNC 127.0.0.1:5900")
+    print(f"VNC password: cat {VNC_PASSWORD_TXT}  (mode 600)")
+
+
+def close_golden_chrome() -> None:
+    """Close golden Chrome with CDP's Browser.close, which writes its cookies
+    to disk. Stopping the unit sends SIGTERM instead, and Chrome then drops
+    every cookie it has not yet saved: it saves cookies in batches, so an
+    import that stops Chrome right after writing them leaves the golden
+    profile with none."""
+    try:
+        version = http_json(f"http://127.0.0.1:{GOLDEN_CDP_PORT}/json/version")
+    except OSError:
+        return  # CDP not answering: no Chrome to save anything from
+
+    async def close() -> None:
+        async with websockets.connect(version["webSocketDebuggerUrl"]) as ws:
+            await ws.send(json.dumps({"id": 1, "method": "Browser.close"}))
+            try:
+                await ws.recv()
+            except websockets.exceptions.ConnectionClosed:
+                pass  # Chrome can exit before it answers
+
+    asyncio.run(close())
+    deadline = time.monotonic() + 15
+    while unit_active("browser-golden-chrome.service"):
+        if time.monotonic() > deadline:
+            die("golden Chrome did not exit within 15s of Browser.close; "
+                "left running so its unsaved cookies are not dropped")
+        time.sleep(0.5)
+
+
+def cmd_golden_stop() -> None:
+    close_golden_chrome()
+    systemctl("stop", "browser-golden.service", check=False)
+    print("golden Chrome stopped")
+
+
+# --- golden import -----------------------------------------------------------------
+#
+# CDP (Chrome DevTools Protocol) is JSON-RPC over one websocket per target.
+# Storage.getCookies/setCookies talk to the *browser* target (from
+# GET /json/version's webSocketDebuggerUrl) and cover every cookie in the
+# instance in one call. DOMStorage is per tab: the import reads each open
+# tab's localStorage from its own websocket, and on the golden side opens
+# one tab per origin (GET/PUT /json/new?<url>), writes into it, then closes
+# it (GET /json/close/<targetId>) - both documented CDP HTTP endpoints, used
+# instead of Target.attachToTarget so every target this code touches gets
+# its own plain websocket connection, matching how the read side already
+# has to work.
+
+def _origin(url: str) -> str | None:
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        return None
+    return f"{parts.scheme}://{parts.netloc}"
+
+
+async def cdp_call(ws: "websockets.WebSocketClientProtocol", ids: "itertools.count",
+                    method: str, params: dict | None = None) -> dict:
+    call_id = next(ids)
+    await ws.send(json.dumps({"id": call_id, "method": method, "params": params or {}}))
+    while True:
+        msg = json.loads(await ws.recv())
+        if msg.get("id") == call_id:
+            if "error" in msg:
+                raise RuntimeError(f"{method}: {msg['error']}")
+            return msg.get("result", {})
+        # anything else is an event with no "id" - not a response to this call
+
+
+async def read_source_cookies(version_url: str) -> list[dict]:
+    version = http_json(version_url)
+    async with websockets.connect(version["webSocketDebuggerUrl"]) as ws:
+        result = await cdp_call(ws, itertools.count(1), "Storage.getCookies")
+    return result.get("cookies", [])
+
+
+async def read_source_local_storage(origins: list[str], tabs: list[dict]) -> dict[str, list[list[str]]]:
+    by_origin: dict[str, list[list[str]]] = {}
+    tab_by_origin = {}
+    for tab in tabs:
+        origin = _origin(tab.get("url", ""))
+        if origin and origin not in tab_by_origin:
+            tab_by_origin[origin] = tab
+    for origin in origins:
+        tab = tab_by_origin.get(origin)
+        if tab is None:
+            continue
+        async with websockets.connect(tab["webSocketDebuggerUrl"]) as ws:
+            ids = itertools.count(1)
+            await cdp_call(ws, ids, "DOMStorage.enable")
+            result = await cdp_call(
+                ws, ids, "DOMStorage.getDOMStorageItems",
+                {"storageId": {"securityOrigin": origin, "isLocalStorage": True}},
+            )
+        by_origin[origin] = result.get("entries", [])
+    return by_origin
+
+
+async def write_golden_cookies(cookies: list[dict]) -> None:
+    if not cookies:
+        return
+    version = http_json(f"http://127.0.0.1:{GOLDEN_CDP_PORT}/json/version")
+    async with websockets.connect(version["webSocketDebuggerUrl"]) as ws:
+        await cdp_call(ws, itertools.count(1), "Storage.setCookies", {"cookies": cookies})
+
+
+async def write_golden_local_storage(origin: str, entries: list[list[str]]) -> None:
+    if not entries:
+        return
+    target = http_json(f"http://127.0.0.1:{GOLDEN_CDP_PORT}/json/new?{origin}", method="PUT")
+    target_id = target["id"]
+    try:
+        # Wait for the new tab to commit to its origin: the tab navigates
+        # asynchronously, and DOMStorage keys by the origin the frame has
+        # actually committed to.
+        await asyncio.sleep(1)
+        async with websockets.connect(target["webSocketDebuggerUrl"]) as ws:
+            ids = itertools.count(1)
+            await cdp_call(ws, ids, "DOMStorage.enable")
+            for key, value in entries:
+                await cdp_call(
+                    ws, ids, "DOMStorage.setDOMStorageItem",
+                    {
+                        "storageId": {"securityOrigin": origin, "isLocalStorage": True},
+                        "key": key,
+                        "value": value,
+                    },
+                )
+    finally:
+        http_call(f"http://127.0.0.1:{GOLDEN_CDP_PORT}/json/close/{target_id}")
+
+
+async def golden_import_async() -> None:
+    tabs_raw = http_json(f"{LOGIN_CDP_URL}/json")
+    tabs = [t for t in tabs_raw if t.get("type") == "page" and _origin(t.get("url", ""))]
+    if not tabs:
+        die("no open tabs with an http(s) origin on the login machine's Chrome at "
+            f"{LOGIN_CDP_URL} - open the pages to import first")
+    origins = sorted({_origin(t["url"]) for t in tabs})
+
+    cookies = await read_source_cookies(f"{LOGIN_CDP_URL}/json/version")
+    local_storage = await read_source_local_storage(origins, tabs)
+
+    started_here = not unit_active("browser-golden-chrome.service")
+    if started_here:
+        cmd_golden_start()
+    else:
+        wait_for_http(f"http://127.0.0.1:{GOLDEN_CDP_PORT}/json/version", timeout=30)
+
+    await write_golden_cookies(cookies)
+    for origin in origins:
+        await write_golden_local_storage(origin, local_storage.get(origin, []))
+
+    cookie_counts = Counter(c["domain"].lstrip(".") for c in cookies)
+    print("cookies by domain:")
+    for domain, count in sorted(cookie_counts.items()):
+        print(f"  {domain}: {count}")
+    print("localStorage by origin:")
+    for origin in origins:
+        print(f"  {origin}: {len(local_storage.get(origin, []))}")
+
+
+def cmd_golden_import() -> None:
+    asyncio.run(golden_import_async())
+    cmd_golden_stop()  # outside the event loop: close_golden_chrome runs its own
+
+
+# --- CLI -------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="browsermaze", description=__doc__,
+                                      formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("lease")
+
+    p_release = sub.add_parser("release")
+    p_release.add_argument("n", type=int)
+
+    p_record = sub.add_parser("record")
+    record_sub = p_record.add_subparsers(dest="record_cmd", required=True)
+    p_rstart = record_sub.add_parser("start")
+    p_rstart.add_argument("n", type=int)
+    p_rstop = record_sub.add_parser("stop")
+    p_rstop.add_argument("n", type=int)
+
+    sub.add_parser("status")
+
+    p_golden = sub.add_parser("golden")
+    golden_sub = p_golden.add_subparsers(dest="golden_cmd", required=True)
+    golden_sub.add_parser("start")
+    golden_sub.add_parser("stop")
+    golden_sub.add_parser("import")
+
+    sub.add_parser("logins")
+
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    require_root()
+    load_config()
+
+    if args.cmd == "lease":
+        cmd_lease()
+    elif args.cmd == "release":
+        cmd_release(args.n)
+    elif args.cmd == "record":
+        if args.record_cmd == "start":
+            cmd_record_start(args.n)
+        else:
+            cmd_record_stop(args.n)
+    elif args.cmd == "status":
+        cmd_status()
+    elif args.cmd == "golden":
+        if args.golden_cmd == "start":
+            cmd_golden_start()
+        elif args.golden_cmd == "stop":
+            cmd_golden_stop()
+        else:
+            cmd_golden_import()
+    elif args.cmd == "logins":
+        cmd_logins()
+
+
+if __name__ == "__main__":
+    main()
