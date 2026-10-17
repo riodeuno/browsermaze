@@ -2,6 +2,9 @@
 
 Changes to browsermaze, newest first. The current version lives in `VERSION`. A release is the git tag `v<VERSION>`.
 
+## 0.4.1 — 2026-10-17
+- Add a security policy with private vulnerability reporting instructions.
+
 ## 0.4.0 — 2026-10-16
 - First public release.
 - `setup.sh` installs the browser pool on Ubuntu 24.04 or 26.04 (x86_64 or arm64) and the `browsermaze` command on your Mac or Linux desktop. `--role pool|login` (env `BROWSERMAZE_ROLE`) picks which; Linux defaults to the pool and macOS to the command. On Linux the command finds Chrome from `CHROME`, else `google-chrome`, `google-chrome-stable`, `chromium` or `chromium-browser` on PATH. It asks each question once, takes every answer from a flag or an environment variable, and ends with a checklist that names a fix for each failure.
